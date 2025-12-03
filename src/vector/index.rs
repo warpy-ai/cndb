@@ -3,4 +3,3 @@
 pub struct VectorIndex {
     // Vector index implementation will go here
 }
-

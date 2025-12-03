@@ -3,4 +3,3 @@
 pub struct FileFormat {
     // File format implementation will go here
 }
-

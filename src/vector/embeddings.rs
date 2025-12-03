@@ -3,4 +3,3 @@
 pub struct Embeddings {
     // Embeddings implementation will go here
 }
-
