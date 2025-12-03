@@ -3,4 +3,3 @@
 pub struct Query {
     // Query implementation will go here
 }
-
