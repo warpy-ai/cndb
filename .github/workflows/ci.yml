@@ -46,15 +46,18 @@ jobs:
       - name: Run clippy
         env:
           LIBTORCH_USE_PYTORCH: 1
+          LIBTORCH_BYPASS_VERSION_CHECK: 1
         run: cargo clippy -- -D warnings
       
       - name: Build
         env:
           LIBTORCH_USE_PYTORCH: 1
+          LIBTORCH_BYPASS_VERSION_CHECK: 1
         run: cargo build --verbose
       
       - name: Run tests
         env:
           LIBTORCH_USE_PYTORCH: 1
+          LIBTORCH_BYPASS_VERSION_CHECK: 1
         run: cargo test --verbose
 
