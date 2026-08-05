@@ -31,15 +31,33 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
       
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install PyTorch
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      
       - name: Check formatting
         run: cargo fmt --check
       
       - name: Run clippy
+        env:
+          LIBTORCH_USE_PYTORCH: 1
+          LIBTORCH_BYPASS_VERSION_CHECK: 1
         run: cargo clippy -- -D warnings
       
       - name: Build
+        env:
+          LIBTORCH_USE_PYTORCH: 1
+          LIBTORCH_BYPASS_VERSION_CHECK: 1
         run: cargo build --verbose
       
       - name: Run tests
+        env:
+          LIBTORCH_USE_PYTORCH: 1
+          LIBTORCH_BYPASS_VERSION_CHECK: 1
         run: cargo test --verbose
 

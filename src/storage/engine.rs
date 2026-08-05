@@ -3,4 +3,3 @@
 pub struct StorageEngine {
     // Storage engine implementation will go here
 }
-
