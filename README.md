@@ -43,8 +43,20 @@ let callers = db.callers("cndb::storage::append_record", Depth(2))?;
 
 ## Status
 
-Early development. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the
-full design, the graph and file-format specifications, and the roadmap.
+Early development. **M1, the storage core, is implemented**: the `.cndb` file
+format, the append-only record log, the document offset map, the BSON codec,
+and crash-safe commit and recovery.
+
+```rust
+let mut db = cndb::Cndb::open("graph.cndb")?;
+let id = db.insert(&json!({ "kind": "Function", "name": "parse_header" }))?;
+db.commit()?;
+assert_eq!(db.get(id)?["kind"], "Function");
+```
+
+The graph model, extraction, query engine, CLI and bindings follow in M2–M6.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design, the
+file-format specification and the roadmap.
 
 ## License
 

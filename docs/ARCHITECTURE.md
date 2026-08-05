@@ -175,28 +175,31 @@ separate binaries' worth of concerns but ship in one binary.
 ### 3.1 File layout
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ HEADER SLOT A  (64 bytes)                                │
-│ HEADER SLOT B  (64 bytes)                                │
-│   magic       [u8; 4]  "CNDB"                            │
-│   version     u32      0x0003_0000                       │
-│   generation  u64      monotonic commit counter          │
-│   master_ptr  u64      byte offset of master index block  │
-│   master_len  u64      length of master index block       │
-│   log_end     u64      first free byte in the record log  │
-│   crc32       u32      checksum over the preceding fields │
-│   reserved    [u8; 24]                                    │
-├──────────────────────────────────────────────────────────┤
-│ RECORD LOG  (append-only, grows forward)                 │
-│   [len u32][kind u8][crc32 u32][BSON payload …]          │
-│   [len u32][kind u8][crc32 u32][BSON payload …]          │
-│   …                                                      │
-│   kind: 0 = Node, 1 = Edge, 2 = Blob, 3 = Tombstone      │
-├──────────────────────────────────────────────────────────┤
-│ MASTER INDEX BLOCK  (bincode, rewritten on each commit)  │
-│   see §3.3                                               │
-└──────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│ HEADER SLOT A   bytes   0..64                                  │
+│ HEADER SLOT B   bytes  64..128                                 │
+│    0..4   magic       [u8; 4]  "CNDB"                          │
+│    4..8   version     u32      0x0003_0000                     │
+│    8..16  generation  u64      monotonic commit counter        │
+│   16..24  master_ptr  u64      offset of the master index      │
+│   24..32  master_len  u64      length of the master payload    │
+│   32..40  log_end     u64      first free byte of the log      │
+│   40..44  crc32       u32      checksum over the whole slot    │
+│   44..64  reserved    [u8; 20] zeroed, covered by the checksum │
+├────────────────────────────────────────────────────────────────┤
+│ RECORD LOG   bytes 128..log_end   (append-only, grows forward) │
+│   [len u32][kind u8][crc32 u32][payload …]                     │
+│   [len u32][kind u8][crc32 u32][payload …]                     │
+│   …                                                            │
+│   kind: 0 Node · 1 Edge · 2 Blob · 3 Tombstone · 4 MasterIndex │
+│   The live master index is the last record; superseded ones    │
+│   remain inline as dead space until compaction (§3.4).         │
+└────────────────────────────────────────────────────────────────┘
 ```
+
+The checksum is computed over all 64 bytes with the `crc32` field itself
+zeroed, so the reserved bytes are covered too and a future version cannot put
+unprotected data there.
 
 ### 3.2 Atomic commit via header ping-pong
 
@@ -204,38 +207,64 @@ v0.2.0 specified overwriting a single header in place. A 64-byte write inside
 one sector is atomic on real hardware, but that is a hardware assumption rather
 than a guarantee. v0.3.0 uses two header slots instead:
 
-1. Append all new records to the log. `fsync`.
-2. Append a fresh master index block after them. `fsync`.
+1. Append all new records at `log_end`. `fsync`.
+2. Append the master index **as an ordinary log record**. `fsync`.
 3. Write a header with `generation + 1` into the **older** of the two slots.
    `fsync`.
 
-On open, read both slots, discard any with a bad magic or CRC, and take the
-survivor with the highest `generation`. A crash at any point leaves the previous
-generation's header fully intact and the partially written bytes beyond
-`log_end` are simply overwritten by the next append. No write-ahead log needed,
-and no torn-header failure mode.
+Step 3 is the commit point. On open, read both slots, discard any with a bad
+magic, bad version or bad CRC, and take the survivor with the highest
+`generation`.
+
+Writing the master index into the log rather than into a reserved trailing
+region is what makes step 1 safe. Appends always start past the live master
+record, so the generation currently on disk keeps a readable index for the
+entire write; scans skip the record by kind. Had the index lived in fixed
+space at the end of the file, step 1 would overwrite the very block the live
+header still points at, and a crash between steps 1 and 3 would leave a valid
+header addressing shredded bytes.
+
+A crash before step 3 therefore leaves the previous header intact, still
+pointing at its own master index, with every new byte sitting beyond the old
+`log_end` where the next append overwrites it. A crash *during* step 3 tears at
+most one slot and the other survives. No write-ahead log is required, which is
+why issue #14's optional WAL does not appear here.
+
+Recovery rewinds to `log_end`; it does not shorten the file. Abandoned bytes
+past `log_end` are never read and are overwritten by subsequent appends, so
+repeated crashes reuse the same space rather than accumulating. Physically
+returning it to the filesystem is compaction's job (§3.4).
 
 ### 3.3 Master index block
 
-One bincode-serialized struct holding every in-memory index:
+One bincode-serialized struct holding every in-memory index. M1 implements the
+first three fields; the rest arrive with the graph and query engines.
 
 ```rust
 pub struct MasterIndex {
+    // ── M1 ──────────────────────────────────────────────────────────
     /// DocId -> byte offset in the record log
-    offsets:  HashMap<DocId, u64>,
-    /// Outgoing adjacency: NodeId -> edges leaving it
-    out_adj:  HashMap<NodeId, Vec<EdgeRef>>,
-    /// Incoming adjacency: NodeId -> edges arriving at it
-    in_adj:   HashMap<NodeId, Vec<EdgeRef>>,
-    /// Fully-qualified symbol name -> candidate nodes
-    by_name:  HashMap<String, Vec<NodeId>>,
-    /// FileId -> every doc extracted from that file (for incremental sync)
-    by_file:  HashMap<FileId, Vec<DocId>>,
-    /// Inverted index over names, signatures and doc comments
-    fts:      InvertedIndex,
+    offsets:     HashMap<DocId, u64>,
     /// Tombstoned doc ids, excluded from all reads
-    dead:     HashSet<DocId>,
-    meta:     DbMeta,
+    dead:        HashSet<DocId>,
+    /// Next id to hand out; never reused, even after a delete
+    next_doc_id: u64,
+
+    // ── M2: graph model ─────────────────────────────────────────────
+    /// Outgoing adjacency: NodeId -> edges leaving it
+    out_adj:     HashMap<NodeId, Vec<EdgeRef>>,
+    /// Incoming adjacency: NodeId -> edges arriving at it
+    in_adj:      HashMap<NodeId, Vec<EdgeRef>>,
+    /// Fully-qualified symbol name -> candidate nodes
+    by_name:     HashMap<String, Vec<NodeId>>,
+
+    // ── M3/M5: extraction and incremental sync ──────────────────────
+    /// FileId -> every doc extracted from that file
+    by_file:     HashMap<FileId, Vec<DocId>>,
+
+    // ── M4: query engine ────────────────────────────────────────────
+    /// Inverted index over names, signatures and doc comments
+    fts:         InvertedIndex,
 }
 
 pub struct EdgeRef {
@@ -244,6 +273,10 @@ pub struct EdgeRef {
     edge_id: DocId,
 }
 ```
+
+bincode is not self-describing, so each of those additions changes the layout.
+`FORMAT_VERSION` in the header is the guard: a file written under an earlier
+layout is rejected at open rather than misread.
 
 `EdgeRef` vectors are kept sorted by `kind`, so a kind-filtered neighbor lookup
 is a binary search plus a contiguous slice — the hot path for every traversal.
@@ -455,10 +488,10 @@ cndb stats
 
 ## 7. Roadmap
 
-| Milestone | Scope | Existing issues |
-|---|---|---|
-| **M1 — Storage core** | header ping-pong, record log, offset map, BSON codec, commit/recover | #5, #6, #7, #8, #14 |
-| **M2 — Graph model** | node/edge types, adjacency + name indexes, filters, traversal primitives | #9, #15 (reframed) |
+| Milestone | Scope | Existing issues | Status |
+|---|---|---|---|
+| **M1 — Storage core** | header ping-pong, record log, offset map, BSON codec, commit/recover | #5, #6, #7, #8, #14 | **done** |
+| **M2 — Graph model** | node/edge types, adjacency + name indexes, filters, traversal primitives | #9, #15 (reframed) | next |
 | **M3 — Extraction** | file walk, tree-sitter for 5 languages, resolution pass, confidence | new |
 | **M4 — Query engine** | FTS index, explore/callers/callees/impact/path/context | new |
 | **M5 — CLI + sync** | binary, JSON output, incremental sync, compaction | new |
