@@ -10,11 +10,12 @@ bson = "2.8"
 bincode = "1.3"
 thiserror = "1.0"
 crc32fast = "1.4"
+console = { version = "0.16", features = ["std"] }
 
-# Vector search (rust-bert, hnsw) is deferred to v1 — see docs/ARCHITECTURE.md.
-# rust-bert pulls torch-sys, whose build script downloads libtorch; it fails to
-# build and rules out a single portable binary. The v1 replacement is a
-# statically linked ONNX/Candle backend.
+# Vector search (rust-bert, hnsw) is deferred to v1 — see docs/ARCHITECTURE.md
+# §1.3. rust-bert pulls torch-sys, which needs a libtorch install at build time
+# and rules out the single portable binary the project depends on. The v1
+# replacement is a statically linked ONNX/Candle backend.
 
 [dev-dependencies]
 criterion = "0.5"
