@@ -2,7 +2,7 @@
 
 **Version:** 0.3.0
 **Status:** Draft
-**Supersedes:** the v0.2.0 technical design in issue #1
+**Supersedes:** the v0.2.0 technical design (issue #1) and the PoC plan (issue #2)
 
 ---
 
@@ -20,33 +20,110 @@ cndb is a storage engine in its own right. It is an alternative to SQLite, not
 a layer on top of one. There is no server, no daemon, no network protocol, and
 no third-party database underneath it.
 
-### 1.1 What changed from v0.2.0
+### 1.1 Lineage
 
-v0.2.0 described a hybrid **document + vector** database validated against an
-e-commerce workload (order history, 10M synthetic orders, concurrent HTTP load).
-v0.3.0 keeps the storage thesis and replaces the data model and the workload.
+Two prior documents define the project. They do not agree with each other, and
+the difference between them matters.
 
-| | v0.2.0 | v0.3.0 |
+**Issue #1 — TDD v0.2.0.** The founding document. Its mission is *"a
+high-performance, self-contained, single-file vector database... the power of
+**contextual semantic search** with the simplicity and portability of a custom,
+SQLite-inspired file format."* Four components: Driver/API, Embedding Engine,
+Vector Index, Custom Storage. A four-method API — `connect`, `add`, `search`,
+`save`. Future work: compaction, single-writer/multi-reader concurrency, and
+C-compatible FFI bindings.
+
+**Issue #2 — PoC.** Reframes cndb as *"a hybrid **NoSQL document + vector**
+database."* This is a scope expansion rather than a restatement: it adds
+collections, full CRUD, `find_where`, aggregations, and hybrid filter+vector
+queries. It then selects an **e-commerce workload** — 10M synthetic orders,
+`OrderHistory`, 100 concurrent JMeter threads — and makes hitting its latency
+targets a binary pass/fail gate on the whole project.
+
+v0.3.0 aligns with issue #1 and steps back from issue #2.
+
+Nothing in the founding document points at e-commerce. Its stated purpose is
+*contextual* retrieval; the repository is named ContextDB; its original README
+described *"contextual data, relevant for your CLI shell."* The intent was
+always context retrieval for a local CLI and LLM workflow. Issue #2 chose an
+e-commerce benchmark to have something measurable and, in doing so, pulled the
+project toward being a general-purpose document store competing with MongoDB.
+
+Indexing a codebase into a queryable graph is a direct expression of issue #1's
+mission. The pivot is a return to it, not a departure from it.
+
+Issue #2's own risk register rated R-05, *"3 weeks insufficient for build,"* at
+**Very High** probability. That risk materialised: ten months after these issues
+were filed, `src/` contained empty stub structs and no PoC had run. The scope
+that could not be built in three weeks was #2's, not #1's.
+
+### 1.2 What carries forward, and what does not
+
+Carried forward from issue #1, unchanged:
+
+- Everything in one `.cndb` file you can copy between machines
+- Local-first, in-process, zero runtime dependencies, no server
+- Append-only log with an atomically committed master index block
+- Custom binary format, no external database underneath
+- A single index pointer to one master block holding every index
+  (issue #2 split this into separate document and vector pointers; #1's
+  single-block design is simpler and is what §3 specifies)
+- C-compatible FFI bindings as a first-class goal, not an afterthought (§6.1)
+- Compaction and single-writer/multi-reader concurrency as known future work
+
+Changed:
+
+| | Prior | v0.3.0 |
 |---|---|---|
-| Primary model | BSON documents | Graph of nodes + edges (stored as documents) |
+| Primary model | BSON documents | Graph of nodes + edges, stored as documents |
 | Primary retrieval | Vector similarity (HNSW) | Graph traversal + full-text |
 | Target workload | E-commerce OLTP, 100 concurrent users | Code intelligence, single local process |
 | Primary consumer | Application code | Coding agents and application code |
-| Vectors | Core, day one | Deferred to v1, behind a feature flag |
+| Record framing | `[len][BSON]` (#1), `[len][collection][BSON]` (#2) | `[len][kind][crc][BSON]` (§3.1) |
+| Header | 16 bytes (#1) / 32 bytes (#2), overwritten in place | 2 × 64-byte slots, ping-pong commit (§3.2) |
 
-Unchanged, and still the point of the project:
+Dropped from issue #2, as scope that served the e-commerce framing:
 
-- Everything in one `.cndb` file you can copy between machines
-- Local-first, in-process, zero runtime dependencies
-- Append-only log with an atomically committed index block
-- Custom binary format, no external database
+- Aggregations (FR-D-06) — `stats` is counting over indexes, not a query engine
+- Concurrent-user latency targets — there is one local process, not 100 users
+- Synthetic 10M-document ingest-rate goals — replaced by §7.2, measured on real
+  repositories
 
-### 1.2 Non-goals for v0
+### 1.3 On deferring vectors
+
+Semantic search is issue #1's stated mission, and deferring it is the largest
+divergence in this document. It is a deferral, not a deletion, and the reasoning
+should be explicit.
+
+Graph traversal answers `callers`, `callees`, `impact` and `path` exactly and
+without embeddings. It is `explore` that suffers: BM25 over identifiers matches
+the literal token `auth`, but a query like *"how do users sign in"* will not
+lexically reach `verify_credentials`. That is the query shape agents actually
+issue, and it is what issue #1 meant by contextual retrieval.
+
+Against that: in code, identifiers are unusually information-dense, so
+lexical ranking over names, signatures and doc comments is stronger than it
+would be over prose. Both comparable projects ship without vectors — CodeGraph
+on SQLite FTS5, Graphify explicitly choosing *"a real graph"* over embeddings.
+Exact structure is the harder half to build and the half that must be correct
+first.
+
+So vectors are v1's first item rather than a possibility, and the format
+reserves room for them now: `MasterIndex` gains an ANN index as another field,
+the record `kind` byte has 252 unused values, and the header keeps 24 reserved
+bytes. No format break is required to add them.
+
+The v1 embedding backend links statically (`fastembed`/ONNX or Candle) and
+embeds symbol signatures and doc comments only — never whole files. `rust-bert`
+is not that backend; see §7.1.
+
+### 1.4 Non-goals for v0
 
 - Distributed or networked operation
 - Multi-writer concurrency (single writer, multiple readers)
-- Vector search and embeddings (v1)
+- Vector search and embeddings (v1 — see §1.3)
 - LLM-driven extraction (v1 — see §5.4)
+- Aggregation and general-purpose query language
 - MCP server (deliberately never — see §6)
 
 ---
@@ -181,6 +258,13 @@ The log is append-only, so updates and deletes are tombstones. `sync` on a
 changed file tombstones everything in `by_file[file_id]` and appends fresh
 records. When `dead.len() / total` crosses a threshold (default 0.3), compaction
 rewrites live records into a sibling file and renames it into place.
+
+Issue #1 listed compaction as future work, which was reasonable for a
+write-mostly-once vector store. The pivot promotes it into v0: a code graph is
+re-synced on every file save, so a working session churns tombstones
+continuously and an un-compacted file would grow without bound during normal
+use. This is the one place where the change of workload makes the storage
+engine's job harder rather than easier.
 
 ---
 
@@ -379,8 +463,12 @@ cndb stats
 | **M4 — Query engine** | FTS index, explore/callers/callees/impact/path/context | new |
 | **M5 — CLI + sync** | binary, JSON output, incremental sync, compaction | new |
 | **M6 — Bindings** | Bun/Node FFI, C-compatible surface | #3 |
-| **v1 — Enrichment** | agent detection, `LlmProvider`, concept nodes, summaries | new |
-| **v1 — Vectors** | fastembed/ONNX embeddings, ANN index, hybrid ranking | #10–#13, #16 (deferred) |
+| **v1.1 — Vectors** | statically linked embeddings, ANN index, hybrid ranking on `explore` | #10–#13, #16 (deferred) |
+| **v1.2 — Enrichment** | agent detection, `LlmProvider`, concept nodes, summaries | new |
+
+Vectors lead v1 rather than trailing it: semantic retrieval is issue #1's
+founding mission, and §1.3 records why it is deferred out of v0 rather than
+abandoned.
 
 ### 7.1 Dependency changes
 
